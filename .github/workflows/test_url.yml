@@ -1,0 +1,39 @@
+name: Test Single URL (Sandbox)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'لینک مانهوا برای تست (URL)'
+        required: true
+        type: string
+      include_paid:
+        description: 'شامل چپترهای پولی/قفل‌دار؟'
+        required: false
+        default: false
+        type: boolean
+      selector:
+        description: 'سلکتور CSS (اختیاری)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  test-scraper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies & Camoufox
+        run: |
+          pip install requests beautifulsoup4 curl_cffi "camoufox[geoip]" playwright
+          python -m camoufox fetch
+
+      - name: Run Test
+        run: python test_scraper.py "${{ inputs.url }}" "${{ inputs.include_paid }}" "${{ inputs.selector }}"
