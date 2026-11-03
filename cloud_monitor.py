@@ -549,3 +549,247 @@ if captured_chapters:
     slug = p.path.rstrip("/").split("/")[-1]
     best = None
     for ch in captured_chapters:
+        if free_only and _paid_row(ch):
+            continue
+        name = f"{ch.get('chapter_name', '')} {ch.get('chapter_slug', '')} {ch.get('number', '')}"
+        mm = CHAPTER_RE.search(name) or re.search(r"\d+(?:\.\d+)?", name)
+        if not mm:
+            continue
+        label = mm.group(1) if mm.lastindex else mm.group(0)
+        if best is None or float(label) > best[0]:
+            best = (float(label), label, ch.get("chapter_slug", "") or "")
+    if best:
+        link = f"{p.scheme}://{p.netloc}/series/{slug}/{best[2]}" if best[2] else url
+        print("RESULT_JSON:" + json.dumps([best[1], link]))
+        sys.exit(0)
+
+raw = norm(html)
+soup = BeautifulSoup(raw, "html.parser")
+clean_dom_noise(soup)
+slugs = extract_slug_tokens(url)
+cands = []
+for a in soup.find_all("a"):
+    href = a.get("href", "") or ""
+    if slugs and not any(s in href.lower() for s in slugs) and "chapter" not in href.lower():
+        continue
+    row_text = norm(a.get_text(" ", strip=True) + " " + (a.parent.get_text(" ", strip=True) if a.parent else ""))
+    m = CHAPTER_RE.search(row_text) or CHAPTER_RE.search(href)
+    if not m:
+        continue
+    ch_num = m.group(1)
+    row_html = str(a) + " " + (str(a.parent) if a.parent else "")
+    paid_flag = is_paid(a) or bool(re.search(r"coin|lock|premium|paywall|🪙|🔒|\b\d+\s*<svg", row_html, re.I))
+    cands.append((float(ch_num), ch_num, fix_chap_url(url, href), paid_flag))
+
+if cands:
+    if free_only and any(not c[3] for c in cands):
+        cands = [c for c in cands if not c[3]]
+    best = max(cands, key=lambda x: x[0])
+    print("RESULT_JSON:" + json.dumps([best[1], best[2]]))
+    sys.exit(0)
+
+sys.exit(1)
+'''
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code, url, "1" if free_only else "0"],
+            capture_output=True,
+            text=True,
+            timeout=95,
+        )
+        for line in (proc.stdout or "").splitlines():
+            if line.startswith("RESULT_JSON:"):
+                res = json.loads(line.split("RESULT_JSON:", 1)[1])
+                return res[0], res[1]
+    except Exception as e:
+        print(f"Camoufox subprocess info: {e}")
+    return None
+
+
+# ==============================================================================
+# تابع مرکزی تشخیص چپتر (ترکیب هر ۴ لایه)
+# ==============================================================================
+def get_latest(url: str, selector: str = "", include_paid: bool = False):
+    free_only = not include_paid
+
+    if not selector.strip():
+        # اگر سایت کلودفلر سنگین مثل luacomic دارد، مستقیم با Camoufox باز کن
+        if "luacomic." in url.lower():
+            cf = camoufox_isolated_latest(url, free_only=free_only)
+            if cf:
+                return cf[0], cf[1]
+
+        # بررسی ماژول‌های اختصاصی
+        mh = mangahub_latest(url)
+        if mh:
+            return mh[0], mh[1]
+        nv = naver_webtoon_latest(url, free_only=free_only)
+        if nv:
+            return nv[0], nv[1]
+        asu = asurascans_latest(url, free_only=free_only)
+        if asu:
+            return asu[0], asu[1]
+        cw = comic_walker_latest(url)
+        if cw:
+            return cw[0], cw[1]
+        hc = heancms_latest(url, free_only=free_only)
+        if hc:
+            return hc[0], hc[1]
+
+    try:
+        resp = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=TIMEOUT)
+        resp.raise_for_status()
+    except Exception as e:
+        cf = camoufox_isolated_latest(url, free_only=free_only)
+        if cf:
+            return cf[0], cf[1]
+        raise e
+
+    raw = norm(resp.text)
+    soup = BeautifulSoup(raw, "html.parser")
+
+    # ۱. اگر کاربر سلکتور دستی داده باشد
+    if selector.strip():
+        el = soup.select_one(selector)
+        if not el:
+            raise ValueError("Selector پیدا نشد")
+        m = re.search(r"\d+(?:\.\d+)?", norm(el.get_text(" ", strip=True)))
+        if not m:
+            raise ValueError("عددی در متن نبود")
+        a = el if el.name == "a" else (el.find("a") or el.find_parent("a"))
+        href = a.get("href", "") if a else ""
+        return m.group(0), fix_chap_url(url, href)
+
+    # ۲. بررسی قالب‌های استاندارد Keiyoushi / Tachiyomi (قبل از حذف تگ‌ها)
+    ky = keiyoushi_template_engine(soup, url, free_only=free_only)
+    if ky:
+        return ky[0], ky[1]
+
+    # ۳. ایزوله‌سازی DOM (حذف سایدبارها و بخش‌های پیشنهادی)
+    clean_dom_noise(soup)
+    slugs = extract_slug_tokens(url)
+
+    anchors = soup.find_all("a")
+    if slugs:
+        own = [
+            a for a in anchors
+            if any(s in (a.get("href", "") or "").lower() for s in slugs)
+            and (CHAPTER_RE.search(a.get("href", "") or "") or CHAPTER_RE.search(norm(a.get_text(" ", strip=True))))
+        ]
+        if own:
+            anchors = own
+
+    cands = []
+    for a in anchors:
+        href = a.get("href", "") or ""
+        for text in (norm(a.get_text(" ", strip=True)), href):
+            m = JP_RE.search(text or "")
+            if m:
+                key, label = _jp(m)
+                cands.append((key, label, href, is_paid(a)))
+                break
+            m = CHAPTER_RE.search(text or "")
+            if m:
+                cands.append(((float(m.group(1)), 0), m.group(1), href, is_paid(a)))
+                break
+
+    if free_only and any(not c[3] for c in cands):
+        cands = [c for c in cands if not c[3]]
+
+    if not cands:
+        # اگر سایت با جاوااسکریپت رندر می‌شود، با Camoufox باز کن
+        cf = camoufox_isolated_latest(url, free_only=free_only)
+        if cf:
+            return cf[0], cf[1]
+        raise ValueError("چپتری پیدا نشد")
+
+    best = max(cands, key=lambda x: x[0])
+    return best[1], fix_chap_url(url, best[2])
+
+
+def sync_telegram_subscribers() -> set:
+    subs = set()
+    if TG_CHAT_ID:
+        for cid in re.split(r"[\s,]+", TG_CHAT_ID):
+            if cid:
+                subs.add(str(cid))
+    if os.path.exists(SUBS_FILE):
+        try:
+            with open(SUBS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    subs.update(str(x) for x in data if x)
+        except Exception:
+            pass
+    return subs
+
+
+def notify(title: str, message: str, link: str = "", tg_subs: set = None) -> bool:
+    if os.environ.get("NOTIFICATIONS_ENABLED", "true").strip().lower() in ("false", "0", "no", "off"):
+        return False
+    ok = False
+    if NTFY_TOPIC:
+        payload = {"topic": NTFY_TOPIC, "title": title, "message": message, "priority": 4, "tags": ["books"]}
+        if link:
+            payload["click"] = link
+        try:
+            r = requests.post(NTFY_SERVER, json=payload, timeout=15)
+            ok = ok or r.ok
+        except Exception:
+            pass
+    if TG_TOKEN and tg_subs:
+        text = f"📚 <b>{title}</b>\n{message}"
+        if link:
+            text += f'\n\n<a href="{link}">📖 باز کردن چپتر</a>'
+        for cid in tg_subs:
+            try:
+                r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={"chat_id": cid, "text": text, "parse_mode": "HTML"}, timeout=15)
+                ok = ok or r.ok
+            except Exception:
+                pass
+    return ok
+
+
+def main():
+    tg_subs = sync_telegram_subscribers()
+    if not os.path.exists(LIST_FILE):
+        print("[!] فایل manhwa_list.json یافت نشد.")
+        return
+
+    with open(LIST_FILE, "r", encoding="utf-8") as f:
+        items = json.load(f)
+
+    changed = False
+    for it in items:
+        if it.get("paused") or not it.get("url"):
+            continue
+        title = it.get("title", "بدون نام")
+        try:
+            ch, link = get_latest(it["url"], it.get("selector", ""), bool(it.get("include_paid")))
+        except Exception as e:
+            print(f"[!] خطا در {title}: {e}")
+            continue
+
+        last = str(it.get("last_chapter", "") or "")
+        if not last:
+            it["last_chapter"] = ch
+            it["last_link"] = link
+            changed = True
+            print(f"[*] مقدار اولیه برای {title}: چپتر {ch}")
+        elif ch != last:
+            kc, kl = chap_key(ch), chap_key(last)
+            if kc and kl and kc > kl and (kc[0] - kl[0] <= 50):
+                print(f"[+] چپتر جدید برای {title}: {last} -> {ch}")
+                notify(f"چپتر جدید: {title}", f"جدید: چپتر {ch}\nقبلی: چپتر {last}", link, tg_subs)
+                it["last_chapter"] = ch
+                it["last_link"] = link
+                changed = True
+
+    if changed:
+        with open(LIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+
+if __name__ == "__main__":
+    main()
