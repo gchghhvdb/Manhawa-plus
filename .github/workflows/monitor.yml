@@ -1,0 +1,43 @@
+name: Manhwa Cloud Monitor
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies & Camoufox
+        run: |
+          pip install requests beautifulsoup4 curl_cffi "camoufox[geoip]" playwright
+          python -m camoufox fetch
+
+      - name: Run monitor script
+        env:
+          NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NOTIFICATIONS_ENABLED: ${{ secrets.NOTIFICATIONS_ENABLED }}
+        run: python cloud_monitor.py
+
+      - name: Save updated chapters
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          touch subscribers.json
+          git add manhwa_list.json subscribers.json
+          git diff --staged --quiet || (git commit -m "Update chapters & subscribers" && git pull --rebase && git push)
