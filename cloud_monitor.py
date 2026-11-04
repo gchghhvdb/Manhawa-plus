@@ -2,11 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Manhawa-Plus: Multi-Engine Autonomous Comic & Manhwa Monitor
-مجهز به ۴ لایه تشخیص خودکار:
-1. ماژول‌های اختصاصی و API مستقیم (Naver, Asura, ComicWalker, HeanCMS/Keyoapp, MangaHub)
-2. موتور قالب‌های جهانی Keiyoushi/Tachiyomi (Madara AJAX, MangaThemesia,WP-Manga, NextData/JSON)
-3. موتور ایزوله‌سازی DOM (حذف سایدبار/تبلیغات و فیلتر هوشمند Slug برای جلوگیری از تشخیص اشتباه)
-4. مرورگر مخفی Camoufox (در پروسه ایزوله برای عبور از Cloudflare Turnstile و شنود ترافیک شبکه)
+مجهز به اتصال مستقیم به دیتابیس رسمی Keiyoushi (Tachiyomi/Mihon Extensions)
 """
 import json
 import os
@@ -34,12 +30,15 @@ TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TIMEOUT = 25
 
+# لینک رسمی دیتابیس Keiyoushi (معادل مستقیم index.pb برای پایتون)
+KEIYOUSHI_REPO_INDEX = "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json"
+_KEIYOUSHI_CACHE = None
+
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ko,ja,en-US;q=0.9,en;q=0.8",
 }
 
-# الگوهای استاندارد استخراج شماره چپتر
 CHAPTER_RE = re.compile(
     r"(?<![a-z])(?:chapter|chap|ch|episode|ep|ملف|فصل|چپتر)[\s\-_.:#/]*(\d{1,5}(?:\.\d+)?)(?!\d)",
     re.I,
@@ -47,10 +46,8 @@ CHAPTER_RE = re.compile(
 HASH_NUM_RE = re.compile(r"(?:^|[\s\#])#?(\d{1,4}(?:\.\d+)?)(?:\s|$)")
 JP_RE = re.compile(r"第\s*(\d+(?:\.\d+)?)\s*話(?:\s*(?:その|パート|part|\.|[-_])?\s*(\d+))?", re.I)
 KR_RE = re.compile(r"(?:제\s*)?(\d+(?:\.\d+)?)\s*화")
-RSS_N_RE = re.compile(r"(?:^|[\[\(【\s])(\d+(?:\.\d+)?)\s*話(?:\s*(?:その|パート)?\s*(\d+))?")
 KEY_RE = re.compile(r"\s*(\d+(?:\.\d+)?)(?:\s*その\s*(\d+))?")
 
-# الگوهای تشخیص چپترهای پولی/قفل‌دار و بخش‌های پیشنهادی
 RECO_RE = re.compile(
     r"recommend|related|similar|you may also|more like|trending|popular|weekly|monthly|hot\s*manga|latest\s*updates|new\s*releases|sidebar",
     re.I,
@@ -61,16 +58,7 @@ PAID_RE = re.compile(
     re.I,
 )
 OPEN_RE = re.compile(r"[\w-]*(?:unlock|lock[\w-]*open|free)[\w-]*", re.I)
-EMB_RE = re.compile(r"\{[^{}]*?chapter_(?:name|slug)[^{}]*\}")
-LOCKED_RE = re.compile(
-    r"locked chapter|waiting to be unlocked|chapter is locked|login to unlock chapter"
-    r"|cost to unlock|sign in to unlock|unlock this (?:exciting )?chapter"
-    r"|early access|asura\+|subscribe to read|purchase this chapter|unlock with"
-    r"|this chapter is locked|premium chapter|read early with",
-    re.I,
-)
 
-# سلکتورهای استاندارد مخزن Keiyoushi (برای قالب‌های Madara, MangaThemesia, WP-Manga, FoolSlide, Mangabox و...)
 KEIYOUSHI_CHAPTER_SELECTORS = [
     "li.wp-manga-chapter > a",                   # Madara Standard
     "#chapterlist ul li a",                      # MangaThemesia / Mangastream
@@ -78,7 +66,7 @@ KEIYOUSHI_CHAPTER_SELECTORS = [
     "ul.main.version-chap li.wp-manga-chapter a",# Madara Variant
     "div.chapter-list div.row span a",           # Mangakakalot / Mangabox
     "ul.row-content-chapter li a.chapter-name",  # Manganelo / Manganato
-    "div#list-chapter ul.list-chapter li a",     # Truyen / Novel / Manhua templates
+    "div#list-chapter ul.list-chapter li a",     # Novel / Manhua templates
     "div.list-chapter ul li a",
     "table.table-chapter tbody tr td a",
     "div.chapters-list a[href*='chapter']",
@@ -120,7 +108,6 @@ def _chap_anchor(x) -> bool:
 def is_paid(tag) -> bool:
     if _paid_text(tag):
         return True
-    # بررسی تگ والد در قالب‌های MangaThemesia / Madara (مثل کلاس‌های قفل یا آیکون سکه)
     row, node = tag, tag.parent
     while node is not None and getattr(node, "name", None) not in (None, "body", "html", "[document]"):
         if sum(1 for x in node.find_all("a") if _chap_anchor(x)) > 1:
@@ -165,13 +152,14 @@ def fix_chap_url(base_url: str, href: str) -> str:
 
 
 def extract_slug_tokens(url: str) -> set:
-    """استخراج نام اصلی مانهوا (Slug) برای فیلتر کردن چپترهای متفرقه سایدبار"""
     p = urlparse(url)
-    parts = [x for x in p.path.rstrip("/").split("/") if x and x.lower() not in ("manga", "series", "comic", "comics", "webtoon", "title", "detail", "en", "ko", "ja")]
+    parts = [
+        x for x in p.path.rstrip("/").split("/")
+        if x and x.lower() not in ("manga", "series", "comic", "comics", "webtoon", "title", "detail", "en", "ko", "ja")
+    ]
     slugs = set()
     if parts:
         raw_slug = parts[-1].lower()
-        # حذف کدهای هش آخر آدرس مثل -a1b2c3d4
         clean_slug = re.sub(r"-[0-9a-f]{6,10}$", "", raw_slug)
         if len(raw_slug) >= 3:
             slugs.add(raw_slug)
@@ -181,7 +169,6 @@ def extract_slug_tokens(url: str) -> set:
 
 
 def clean_dom_noise(soup: BeautifulSoup):
-    """حذف سایدبارها، فوتر، هدر و لیست‌های پیشنهادی (Popular / Related) قبل از اسکرپ"""
     for tag in soup.find_all(["aside", "footer", "nav", "header"]):
         tag.decompose()
     for el in soup.find_all(["div", "section", "ul"]):
@@ -194,10 +181,44 @@ def clean_dom_noise(soup: BeautifulSoup):
 
 
 # ==============================================================================
+# اتصال مستقیم به مخزن زنده Keiyoushi (https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json)
+# ==============================================================================
+def lookup_keiyoushi_source(url: str):
+    """جستجوی دامنه سایت در دیتابیس رسمی Keiyoushi و تشخیص نوع افزونه"""
+    global _KEIYOUSHI_CACHE
+    host = urlparse(url).netloc.lower().removeprefix("www.").removeprefix("m.")
+    if not host:
+        return None
+
+    if _KEIYOUSHI_CACHE is None:
+        try:
+            r = requests.get(KEIYOUSHI_REPO_INDEX, impersonate="chrome124", timeout=15)
+            if r.status_code == 200:
+                _KEIYOUSHI_CACHE = r.json()
+            else:
+                _KEIYOUSHI_CACHE = []
+        except Exception:
+            _KEIYOUSHI_CACHE = []
+
+    for ext in _KEIYOUSHI_CACHE:
+        for src in ext.get("sources") or []:
+            base_url = (src.get("baseUrl") or "").lower()
+            if host in base_url:
+                info = {
+                    "name": src.get("name"),
+                    "pkg": ext.get("pkg", ""),
+                    "lang": src.get("lang", ""),
+                    "baseUrl": src.get("baseUrl", ""),
+                }
+                print(f"[Keiyoushi DB] 🌐 سایت در مخزن رسمی Keiyoushi شناسایی شد: {info['name']} ({info['pkg']})")
+                return info
+    return None
+
+
+# ==============================================================================
 # لایه ۱: ماژول‌های اختصاصی (Naver, Asura, ComicWalker, HeanCMS, MangaHub)
 # ==============================================================================
 def mangahub_latest(url: str):
-    """پشتیبانی اختصاصی و ضد خطا از mangahub.io (جلوگیری از قاطی شدن با سایدبار)"""
     if "mangahub.io" not in url.lower():
         return None
     p = urlparse(url)
@@ -206,11 +227,8 @@ def mangahub_latest(url: str):
         return None
     slug = m_slug.group(1).lower()
 
-    # ۱. استخراج از API رسمی GraphQL سایت MangaHub
     try:
-        gql_query = {
-            "query": f'{{manga(x:m01,slug:"{slug}"){{latestChapter}}}}'
-        }
+        gql_query = {"query": f'{{manga(x:m01,slug:"{slug}"){{latestChapter}}}}'}
         r_api = requests.post(
             "https://api.mghcdn.com/graphql",
             json=gql_query,
@@ -227,7 +245,6 @@ def mangahub_latest(url: str):
     except Exception:
         pass
 
-    # ۲. استخراج از HTML صفحه فقط با تطابق دقیق Slug
     try:
         r = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=20)
         if r.status_code == 200:
@@ -403,11 +420,7 @@ def heancms_latest(url: str, free_only: bool = True):
 # ==============================================================================
 # لایه ۲: موتور قالب‌های جهانی Keiyoushi (Madara AJAX + MangaThemesia + Selectors)
 # ==============================================================================
-def keiyoushi_template_engine(soup: BeautifulSoup, url: str, free_only: bool = True):
-    """تشخیص خودکار قالب سایت بر اساس الگوهای استاندارد مخزن Keiyoushi/Tachiyomi"""
-    slugs = extract_slug_tokens(url)
-
-    # الف) قالب MangaThemesia: دارای تگ <li data-num="..."> داخل #chapterlist
+def keiyoushi_template_engine(soup: BeautifulSoup, url: str, free_only: bool = True, ky_info: dict = None):
     ts_items = soup.select("#chapterlist li[data-num], ul.clstyle li[data-num]")
     if ts_items:
         cands = []
@@ -427,7 +440,6 @@ def keiyoushi_template_engine(soup: BeautifulSoup, url: str, free_only: bool = T
             best = max(cands, key=lambda x: x[0])
             return best[1], best[2]
 
-    # ب) بررسی سلکتورهای استاندارد Keiyoushi (Madara / Mangabox / WP-Manga)
     for sel in KEIYOUSHI_CHAPTER_SELECTORS:
         els = soup.select(sel)
         if not els:
@@ -447,9 +459,10 @@ def keiyoushi_template_engine(soup: BeautifulSoup, url: str, free_only: bool = T
             best = max(cands, key=lambda x: x[0])
             return best[1], best[2]
 
-    # پ) درخواست AJAX قالب Madara (برای سایت‌هایی که لیست چپتر را با POST لود می‌کنند)
-    is_madara = bool(
-        soup.select_one("div#manga-chapters-holder, body.wp-manga-template-default, input.rating-post-id")
+    pkg_name = (ky_info or {}).get("pkg", "").lower()
+    is_madara = (
+        "madara" in pkg_name
+        or bool(soup.select_one("div#manga-chapters-holder, body.wp-manga-template-default, input.rating-post-id"))
     )
     if is_madara:
         try:
@@ -484,7 +497,6 @@ def keiyoushi_template_engine(soup: BeautifulSoup, url: str, free_only: bool = T
 # لایه ۴: موتور ایزوله Camoufox برای کلودفلر سنگین و سایت‌های جاوااسکریپتی (SPA)
 # ==============================================================================
 def camoufox_isolated_latest(url: str, free_only: bool = True):
-    """اجرای Camoufox در یک پروسه کاملاً مستقل برای جلوگیری از تداخل با curl_cffi"""
     print(f"[*] 🦊 فعال‌سازی موتور ضد کلودفلر Camoufox برای: {url}")
     code = r'''
 import sys, re, json
@@ -607,19 +619,20 @@ sys.exit(1)
 
 
 # ==============================================================================
-# تابع مرکزی تشخیص چپتر (ترکیب هر ۴ لایه)
+# تابع مرکزی تشخیص چپتر (ترکیب دیتابیس زنده Keiyoushi + ۴ لایه هوشمند)
 # ==============================================================================
 def get_latest(url: str, selector: str = "", include_paid: bool = False):
     free_only = not include_paid
 
+    # استعلام مستقیم از دیتابیس آنلاین Keiyoushi
+    ky_info = lookup_keiyoushi_source(url)
+
     if not selector.strip():
-        # اگر سایت کلودفلر سنگین مثل luacomic دارد، مستقیم با Camoufox باز کن
         if "luacomic." in url.lower():
             cf = camoufox_isolated_latest(url, free_only=free_only)
             if cf:
                 return cf[0], cf[1]
 
-        # بررسی ماژول‌های اختصاصی
         mh = mangahub_latest(url)
         if mh:
             return mh[0], mh[1]
@@ -648,7 +661,6 @@ def get_latest(url: str, selector: str = "", include_paid: bool = False):
     raw = norm(resp.text)
     soup = BeautifulSoup(raw, "html.parser")
 
-    # ۱. اگر کاربر سلکتور دستی داده باشد
     if selector.strip():
         el = soup.select_one(selector)
         if not el:
@@ -660,12 +672,12 @@ def get_latest(url: str, selector: str = "", include_paid: bool = False):
         href = a.get("href", "") if a else ""
         return m.group(0), fix_chap_url(url, href)
 
-    # ۲. بررسی قالب‌های استاندارد Keiyoushi / Tachiyomi (قبل از حذف تگ‌ها)
-    ky = keiyoushi_template_engine(soup, url, free_only=free_only)
+    # بررسی با موتور قالب‌های Keiyoushi
+    ky = keiyoushi_template_engine(soup, url, free_only=free_only, ky_info=ky_info)
     if ky:
         return ky[0], ky[1]
 
-    # ۳. ایزوله‌سازی DOM (حذف سایدبارها و بخش‌های پیشنهادی)
+    # ایزوله‌سازی DOM (حذف سایدبارها و بخش‌های پیشنهادی)
     clean_dom_noise(soup)
     slugs = extract_slug_tokens(url)
 
@@ -697,7 +709,6 @@ def get_latest(url: str, selector: str = "", include_paid: bool = False):
         cands = [c for c in cands if not c[3]]
 
     if not cands:
-        # اگر سایت با جاوااسکریپت رندر می‌شود، با Camoufox باز کن
         cf = camoufox_isolated_latest(url, free_only=free_only)
         if cf:
             return cf[0], cf[1]
