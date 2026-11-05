@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Manhawa-Plus: Multi-Engine Autonomous Comic & Manhwa Monitor
-مجهز به اتصال مستقیم به دیتابیس رسمی Keiyoushi (Tachiyomi/Mihon Extensions)
+مجهز به اتصال مستقیم به دیتابیس رسمی Keiyoushi + موتور ایزوله و مستقل Camoufox
 """
 import json
 import os
@@ -30,8 +30,8 @@ TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TIMEOUT = 25
 
-# لینک رسمی دیتابیس Keiyoushi (معادل مستقیم index.pb برای پایتون)
 KEIYOUSHI_REPO_INDEX = "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json"
+RAW_SOURCE_BASE = "https://raw.githubusercontent.com/keiyoushi/extensions-source/main"
 _KEIYOUSHI_CACHE = None
 
 HEADERS = {
@@ -60,13 +60,13 @@ PAID_RE = re.compile(
 OPEN_RE = re.compile(r"[\w-]*(?:unlock|lock[\w-]*open|free)[\w-]*", re.I)
 
 KEIYOUSHI_CHAPTER_SELECTORS = [
-    "li.wp-manga-chapter > a",                   # Madara Standard
-    "#chapterlist ul li a",                      # MangaThemesia / Mangastream
-    "div.eph-num a",                             # MangaThemesia Variant
-    "ul.main.version-chap li.wp-manga-chapter a",# Madara Variant
-    "div.chapter-list div.row span a",           # Mangakakalot / Mangabox
-    "ul.row-content-chapter li a.chapter-name",  # Manganelo / Manganato
-    "div#list-chapter ul.list-chapter li a",     # Novel / Manhua templates
+    "li.wp-manga-chapter > a",
+    "#chapterlist ul li a",
+    "div.eph-num a",
+    "ul.main.version-chap li.wp-manga-chapter a",
+    "div.chapter-list div.row span a",
+    "ul.row-content-chapter li a.chapter-name",
+    "div#list-chapter ul.list-chapter li a",
     "div.list-chapter ul li a",
     "table.table-chapter tbody tr td a",
     "div.chapters-list a[href*='chapter']",
@@ -181,38 +181,74 @@ def clean_dom_noise(soup: BeautifulSoup):
 
 
 # ==============================================================================
-# اتصال مستقیم به مخزن زنده Keiyoushi (https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json)
+# اتصال مستقیم و هوشمند به دیتابیس و سورس Keiyoushi
 # ==============================================================================
 def lookup_keiyoushi_source(url: str):
-    """جستجوی دامنه سایت در دیتابیس رسمی Keiyoushi و تشخیص نوع افزونه"""
+    """جستجوی دامنه یا نام برند سایت در دیتابیس رسمی Keiyoushi و کشف قالب آن از گیت‌هاب"""
     global _KEIYOUSHI_CACHE
     host = urlparse(url).netloc.lower().removeprefix("www.").removeprefix("m.")
     if not host:
         return None
 
+    domain_core = host.split(".")[0]
+    brand_root = re.sub(r"(?:scans?|comics?|manga|toons?|manhwa|webtoons?|org|net|com)$", "", domain_core)
+
     if _KEIYOUSHI_CACHE is None:
         try:
             r = requests.get(KEIYOUSHI_REPO_INDEX, impersonate="chrome124", timeout=15)
-            if r.status_code == 200:
-                _KEIYOUSHI_CACHE = r.json()
-            else:
-                _KEIYOUSHI_CACHE = []
+            _KEIYOUSHI_CACHE = r.json() if r.status_code == 200 else []
         except Exception:
             _KEIYOUSHI_CACHE = []
 
+    matched_ext, matched_src = None, None
+    # مرحله ۱: تطابق دقیق دامنه
     for ext in _KEIYOUSHI_CACHE:
         for src in ext.get("sources") or []:
-            base_url = (src.get("baseUrl") or "").lower()
-            if host in base_url:
-                info = {
-                    "name": src.get("name"),
-                    "pkg": ext.get("pkg", ""),
-                    "lang": src.get("lang", ""),
-                    "baseUrl": src.get("baseUrl", ""),
-                }
-                print(f"[Keiyoushi DB] 🌐 سایت در مخزن رسمی Keiyoushi شناسایی شد: {info['name']} ({info['pkg']})")
-                return info
-    return None
+            base_u = (src.get("baseUrl") or "").lower()
+            if host in base_u:
+                matched_ext, matched_src = ext, src
+                break
+        if matched_ext:
+            break
+
+    # مرحله ۲: تطابق هوشمند نام برند (مثلاً luacomic -> Lua Scans / asuracomic -> Asura Scans)
+    if not matched_ext and len(brand_root) >= 3:
+        for ext in _KEIYOUSHI_CACHE:
+            pkg_tail = (ext.get("pkg") or "").split(".")[-1].lower()
+            for src in ext.get("sources") or []:
+                sname = re.sub(r"[^a-z0-9]", "", (src.get("name") or "").lower())
+                if brand_root in pkg_tail or sname.startswith(brand_root):
+                    matched_ext, matched_src = ext, src
+                    break
+            if matched_ext:
+                break
+
+    if not matched_ext:
+        return None
+
+    pkg = matched_ext.get("pkg", "")
+    info = {
+        "name": matched_src.get("name"),
+        "pkg": pkg,
+        "baseUrl": matched_src.get("baseUrl", ""),
+        "theme": "custom",
+    }
+
+    parts = pkg.split(".")
+    if len(parts) >= 2:
+        lang_folder, site_folder = parts[-2], parts[-1]
+        gradle_url = f"{RAW_SOURCE_BASE}/src/{lang_folder}/{site_folder}/build.gradle"
+        try:
+            rg = requests.get(gradle_url, impersonate="chrome124", timeout=10)
+            if rg.status_code == 200:
+                m_th = re.search(r"themePkg\s*=\s*['\"]([^'\"]+)['\"]", rg.text)
+                if m_th:
+                    info["theme"] = m_th.group(1).lower()
+        except Exception:
+            pass
+
+    print(f"[Keiyoushi DB] 🌐 افزونه شناسایی شد: {info['name']} | موتور: {info['theme'].upper()} | پکیج: {pkg}")
+    return info
 
 
 # ==============================================================================
@@ -306,7 +342,7 @@ def naver_webtoon_latest(url: str, free_only: bool = True):
 
 
 def asurascans_latest(url: str, free_only: bool = True):
-    if "asurascans" not in url.lower():
+    if "asurascans" not in url.lower() and "asuracomic" not in url.lower():
         return None
     try:
         resp = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=TIMEOUT)
@@ -459,9 +495,11 @@ def keiyoushi_template_engine(soup: BeautifulSoup, url: str, free_only: bool = T
             best = max(cands, key=lambda x: x[0])
             return best[1], best[2]
 
+    theme_name = (ky_info or {}).get("theme", "").lower()
     pkg_name = (ky_info or {}).get("pkg", "").lower()
     is_madara = (
-        "madara" in pkg_name
+        "madara" in theme_name
+        or "madara" in pkg_name
         or bool(soup.select_one("div#manga-chapters-holder, body.wp-manga-template-default, input.rating-post-id"))
     )
     if is_madara:
@@ -494,25 +532,46 @@ def keiyoushi_template_engine(soup: BeautifulSoup, url: str, free_only: bool = T
 
 
 # ==============================================================================
-# لایه ۴: موتور ایزوله Camoufox برای کلودفلر سنگین و سایت‌های جاوااسکریپتی (SPA)
+# لایه ۴: موتور کاملاً مستقل و ایزوله Camoufox (بدون وابستگی ایمپورت خارجی)
 # ==============================================================================
 def camoufox_isolated_latest(url: str, free_only: bool = True):
-    print(f"[*] 🦊 فعال‌سازی موتور ضد کلودفلر Camoufox برای: {url}")
+    print(f"[*] 🦊 باز کردن سایت با مرورگر ضد کلودفلر Camoufox:\n    {url}")
     code = r'''
-import sys, re, json
-from urllib.parse import urlparse
+import sys, re, json, unicodedata
+from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from camoufox.sync_api import Camoufox
-from cloud_monitor import CHAPTER_RE, is_paid, norm, fix_chap_url, _paid_row, clean_dom_noise, extract_slug_tokens
 
 url = sys.argv[1]
 free_only = sys.argv[2] == "1"
+
+CHAPTER_RE = re.compile(r"(?<![a-z])(?:chapter|chap|ch|episode|ep)[\s\-_.:#/]*(\d{1,5}(?:\.\d+)?)(?!\d)", re.I)
+
+def norm(s):
+    return unicodedata.normalize("NFKC", str(s or ""))
+
+def is_paid_row(ch):
+    for k, v in ch.items():
+        key = str(k).lower()
+        if any(w in key for w in ("price", "coin", "cost")):
+            try:
+                if float(v or 0) > 0:
+                    return True
+            except Exception:
+                pass
+        elif key in ("is_premium", "premium", "locked", "is_locked", "paid", "is_paid", "is_early_access"):
+            if v is True or str(v).lower() in ("1", "true", "yes"):
+                return True
+    return False
+
 captured_chapters = []
 
 def handle_response(response):
     try:
-        if any(k in response.url.lower() for k in ("api.", "chapter", "series", "episode", "graphql")):
-            if "json" in (response.headers.get("content-type") or ""):
+        u_low = response.url.lower()
+        if any(k in u_low for k in ("api.", "chapter", "series", "episode", "query")):
+            ct = (response.headers.get("content-type") or "").lower()
+            if "json" in ct:
                 data = response.json()
                 rows = []
                 if isinstance(data, dict):
@@ -535,11 +594,11 @@ with Camoufox(headless=True, os="linux", humanize=True) as browser:
     page = browser.new_page()
     page.on("response", handle_response)
     page.goto(url, wait_until="domcontentloaded", timeout=45000)
-    for _ in range(8):
+    for _ in range(7):
         page.wait_for_timeout(3000)
         title = page.title()
         content = page.content()
-        if captured_chapters or ("just a moment" not in title.lower() and re.search(r"chapter\s*\d+", content, re.I)):
+        if captured_chapters or ("just a moment" not in title.lower() and "attention required" not in title.lower() and re.search(r"chapter\s*\d+", content, re.I)):
             break
         try:
             for frame in page.frames:
@@ -551,17 +610,21 @@ with Camoufox(headless=True, os="linux", humanize=True) as browser:
             pass
     try:
         page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(2000)
     except Exception:
         pass
+    page_title = page.title()
     html = page.content()
 
+print(f"    📄 عنوان صفحه باز شده: {page_title}")
+
 if captured_chapters:
+    print(f"    🎯 شکار مستقیم {len(captured_chapters)} چپتر از API داخلی سایت!")
     p = urlparse(url)
     slug = p.path.rstrip("/").split("/")[-1]
     best = None
     for ch in captured_chapters:
-        if free_only and _paid_row(ch):
+        if free_only and is_paid_row(ch):
             continue
         name = f"{ch.get('chapter_name', '')} {ch.get('chapter_slug', '')} {ch.get('number', '')}"
         mm = CHAPTER_RE.search(name) or re.search(r"\d+(?:\.\d+)?", name)
@@ -575,14 +638,17 @@ if captured_chapters:
         print("RESULT_JSON:" + json.dumps([best[1], link]))
         sys.exit(0)
 
-raw = norm(html)
-soup = BeautifulSoup(raw, "html.parser")
-clean_dom_noise(soup)
-slugs = extract_slug_tokens(url)
+soup = BeautifulSoup(norm(html), "html.parser")
+for tag in soup.find_all(["aside", "footer", "nav", "header"]):
+    tag.decompose()
+
+p_parts = [x for x in urlparse(url).path.rstrip("/").split("/") if x]
+slug = p_parts[-1].lower() if p_parts else ""
+
 cands = []
 for a in soup.find_all("a"):
     href = a.get("href", "") or ""
-    if slugs and not any(s in href.lower() for s in slugs) and "chapter" not in href.lower():
+    if slug and len(slug) > 4 and slug not in href.lower() and "chapter" not in href.lower():
         continue
     row_text = norm(a.get_text(" ", strip=True) + " " + (a.parent.get_text(" ", strip=True) if a.parent else ""))
     m = CHAPTER_RE.search(row_text) or CHAPTER_RE.search(href)
@@ -590,8 +656,8 @@ for a in soup.find_all("a"):
         continue
     ch_num = m.group(1)
     row_html = str(a) + " " + (str(a.parent) if a.parent else "")
-    paid_flag = is_paid(a) or bool(re.search(r"coin|lock|premium|paywall|🪙|🔒|\b\d+\s*<svg", row_html, re.I))
-    cands.append((float(ch_num), ch_num, fix_chap_url(url, href), paid_flag))
+    paid_flag = bool(re.search(r"coin|lock|premium|paywall|early\s*access|🪙|🔒|\b\d+\s*<svg", row_html, re.I))
+    cands.append((float(ch_num), ch_num, urljoin(url, href), paid_flag))
 
 if cands:
     if free_only and any(not c[3] for c in cands):
@@ -613,22 +679,28 @@ sys.exit(1)
             if line.startswith("RESULT_JSON:"):
                 res = json.loads(line.split("RESULT_JSON:", 1)[1])
                 return res[0], res[1]
+            elif line.strip():
+                print(line)
+        if proc.stderr:
+            err_lines = [l for l in proc.stderr.splitlines() if "warning" not in l.lower()]
+            if err_lines:
+                print("    ⚠️ Camoufox log:", err_lines[-1])
     except Exception as e:
-        print(f"Camoufox subprocess info: {e}")
+        print(f"    ⚠️ Camoufox subprocess info: {e}")
     return None
 
 
 # ==============================================================================
-# تابع مرکزی تشخیص چپتر (ترکیب دیتابیس زنده Keiyoushi + ۴ لایه هوشمند)
+# تابع مرکزی تشخیص چپتر
 # ==============================================================================
 def get_latest(url: str, selector: str = "", include_paid: bool = False):
     free_only = not include_paid
-
-    # استعلام مستقیم از دیتابیس آنلاین Keiyoushi
     ky_info = lookup_keiyoushi_source(url)
+    cf_attempted = False
 
     if not selector.strip():
         if "luacomic." in url.lower():
+            cf_attempted = True
             cf = camoufox_isolated_latest(url, free_only=free_only)
             if cf:
                 return cf[0], cf[1]
@@ -653,9 +725,10 @@ def get_latest(url: str, selector: str = "", include_paid: bool = False):
         resp = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=TIMEOUT)
         resp.raise_for_status()
     except Exception as e:
-        cf = camoufox_isolated_latest(url, free_only=free_only)
-        if cf:
-            return cf[0], cf[1]
+        if not cf_attempted:
+            cf = camoufox_isolated_latest(url, free_only=free_only)
+            if cf:
+                return cf[0], cf[1]
         raise e
 
     raw = norm(resp.text)
@@ -672,12 +745,10 @@ def get_latest(url: str, selector: str = "", include_paid: bool = False):
         href = a.get("href", "") if a else ""
         return m.group(0), fix_chap_url(url, href)
 
-    # بررسی با موتور قالب‌های Keiyoushi
     ky = keiyoushi_template_engine(soup, url, free_only=free_only, ky_info=ky_info)
     if ky:
         return ky[0], ky[1]
 
-    # ایزوله‌سازی DOM (حذف سایدبارها و بخش‌های پیشنهادی)
     clean_dom_noise(soup)
     slugs = extract_slug_tokens(url)
 
@@ -709,9 +780,10 @@ def get_latest(url: str, selector: str = "", include_paid: bool = False):
         cands = [c for c in cands if not c[3]]
 
     if not cands:
-        cf = camoufox_isolated_latest(url, free_only=free_only)
-        if cf:
-            return cf[0], cf[1]
+        if not cf_attempted:
+            cf = camoufox_isolated_latest(url, free_only=free_only)
+            if cf:
+                return cf[0], cf[1]
         raise ValueError("چپتری پیدا نشد")
 
     best = max(cands, key=lambda x: x[0])
